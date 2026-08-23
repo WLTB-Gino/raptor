@@ -114,6 +114,9 @@ typedef struct {
 				     * never persisted, so the configured rate in
 				     * enc_cfg/config stays the camera's truth. */
 	uint32_t active_fps_den;
+	bool track_src_seq;    /* stamp HAL frame.seq into ring publishes */
+	bool src_seq_seen;	   /* first stamped frame only sets the baseline */
+	uint32_t last_src_seq; /* previous frame.seq, for gap WARN logging */
 } rvd_stream_t;
 
 /* Per-OSD-region state (dynamic, name-based) */

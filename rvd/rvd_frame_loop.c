@@ -103,6 +103,19 @@ void *rvd_encoder_thread(void *arg)
 			  (long long)(pulse_interval_us / 1000));
 	bool had_readers = false; /* pulse pacing applies to held demand only */
 
+	/*
+	 * Source frame-counter tracking: H.264 channels stamp the HAL's
+	 * per-channel frame sequence (IMPEncoderStream.seq on Ingenic,
+	 * v4l2_buffer.sequence on the V4L2 backend) into every ring
+	 * publish, giving exact producer-side loss accounting (ring v5).
+	 * JPEG channels are excluded: the old-SDK HAL fps divider drops
+	 * frames after fetch and pulse duty-cycling skips whole receive
+	 * windows, so their seq is legitimately non-contiguous and gap
+	 * math would report phantom loss.
+	 */
+	s->track_src_seq = !s->is_jpeg;
+	s->src_seq_seen = false;
+
 	while (rss_running(st->running) && atomic_load(&st->stream_active[idx])) {
 		/* JPEG on-demand: start/stop encoder based on ring consumers */
 		if (s->is_jpeg && s->jpeg_idle && s->ring) {
@@ -199,6 +212,29 @@ void *rvd_encoder_thread(void *arg)
 			continue;
 		}
 
+		/*
+		 * Source sequence gap detection. The HAL's per-channel frame
+		 * counter (IMPEncoderStream.seq / v4l2_buffer.sequence) is
+		 * monotonic per channel: a jump of gap>1 means gap-1 frames
+		 * never reached this thread (encoder stall, missed interrupt,
+		 * kernel-side drop). The ring tallies these into drop_source
+		 * at publish; this WARN puts the when-and-where in the log.
+		 * Backward jumps are encoder restarts, not loss.
+		 */
+		if (s->track_src_seq && frame.seq != RSS_SRC_SEQ_NONE) {
+			if (s->src_seq_seen) {
+				int32_t gap = (int32_t)(frame.seq - s->last_src_seq);
+				if (gap > 1)
+					RSS_WARN("stream%d: source frame gap: seq %u -> %u (%d frame(s) missed)",
+						 idx, s->last_src_seq, frame.seq, gap - 1);
+				else if (gap < 0)
+					RSS_WARN("stream%d: source seq reset: %u -> %u (encoder restart?)",
+						 idx, s->last_src_seq, frame.seq);
+			}
+			s->src_seq_seen = true;
+			s->last_src_seq = frame.seq;
+		}
+
 		/* Refmode: publish a reference (offset+length) into the encoder's
 		 * DMA output buffer. Assumes all NALs are contiguous starting at
 		 * nals[0].data — guaranteed by the Ingenic encoder IP which packs
@@ -274,9 +310,10 @@ void *rvd_encoder_thread(void *arg)
 			}
 		found_buf:
 
-			ret = rss_ring_publish_ref(s->ring, rmem_off, (uint32_t)total_len64,
-						   frame.timestamp, primary_nal_type(&frame),
-						   frame.is_key ? 1 : 0, buf_idx);
+			ret = rss_ring_publish_ref_seq(s->ring, rmem_off, (uint32_t)total_len64,
+						       frame.timestamp, primary_nal_type(&frame),
+						       frame.is_key ? 1 : 0, buf_idx,
+						       s->track_src_seq ? frame.seq : RSS_SRC_SEQ_NONE);
 			if (ret != 0) {
 				/* A rejected publish is a dropped frame the ring
 				 * never saw; if it is a keyframe, every client in
@@ -303,8 +340,9 @@ void *rvd_encoder_thread(void *arg)
 				iov[n].data = frame.nals[n].data;
 				iov[n].length = frame.nals[n].length;
 			}
-			ret = rss_ring_publish_iov(s->ring, iov, cnt, frame.timestamp,
-						   primary_nal_type(&frame), frame.is_key ? 1 : 0);
+			ret = rss_ring_publish_iov_seq(s->ring, iov, cnt, frame.timestamp,
+						       primary_nal_type(&frame), frame.is_key ? 1 : 0,
+						       s->track_src_seq ? frame.seq : RSS_SRC_SEQ_NONE);
 			if (ret != 0) {
 				int64_t now_us = rss_timestamp_us();
 				if (now_us - last_pub_warn_us > 5000000) {
@@ -334,7 +372,16 @@ void *rvd_encoder_thread(void *arg)
 			last_utc = now;
 		}
 		if (now - last_stats >= RVD_STATS_INTERVAL_US) {
-			RSS_TRACE("stream%d: %llu frames", idx, (unsigned long long)frame_count);
+			if (s->track_src_seq && s->ring) {
+				rss_ring_loss_t loss;
+				rss_ring_get_loss(s->ring, &loss);
+				RSS_TRACE("stream%d: %llu frames (src_seq %u, missed: %u source, %u publish, %u resets)",
+					  idx, (unsigned long long)frame_count,
+					  loss.src_seq_last == RSS_SRC_SEQ_NONE ? 0 : loss.src_seq_last,
+					  loss.drop_source, loss.drop_publish, loss.src_seq_resets);
+			} else {
+				RSS_TRACE("stream%d: %llu frames", idx, (unsigned long long)frame_count);
+			}
 			last_stats = now;
 		}
 	}

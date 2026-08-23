@@ -400,6 +400,34 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 		return rss_ctrl_resp_json(resp, resp_size, r);
 	}
 
+	if (strcmp(cmd, "get-loss") == 0) {
+		/* Producer-side source-sequence loss accounting (ring v5).
+		 * Only meaningful for channels that stamp their source frame
+		 * counter (H.264 streams; JPEG pulse channels do not). */
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "status", "ok");
+		cJSON *streams = cJSON_AddArrayToObject(r, "streams");
+		for (int i = 0; i < st->stream_count; i++) {
+			rvd_stream_t *s = &st->streams[i];
+			if (!s->ring)
+				continue;
+			rss_ring_loss_t loss;
+			rss_ring_get_loss(s->ring, &loss);
+			cJSON *item = cJSON_CreateObject();
+			cJSON_AddNumberToObject(item, "channel", (double)i);
+			cJSON_AddBoolToObject(item, "tracked", s->track_src_seq);
+			cJSON_AddNumberToObject(item, "src_seq_last",
+						 loss.src_seq_last == RSS_SRC_SEQ_NONE
+							 ? -1
+							 : (double)loss.src_seq_last);
+			cJSON_AddNumberToObject(item, "drop_source", (double)loss.drop_source);
+			cJSON_AddNumberToObject(item, "drop_publish", (double)loss.drop_publish);
+			cJSON_AddNumberToObject(item, "src_seq_resets", (double)loss.src_seq_resets);
+			cJSON_AddItemToArray(streams, item);
+		}
+		return rss_ctrl_resp_json(resp, resp_size, r);
+	}
+
 	if (strcmp(cmd, "get-sensor-fps") == 0) {
 		uint32_t num = 0, den = 0;
 		int ret = RSS_HAL_CALL(st->ops, isp_get_sensor_fps, st->hal_ctx, &num, &den);

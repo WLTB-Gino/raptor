@@ -103,6 +103,23 @@ static void print_header(const rss_ring_header_t *hdr, const char *name)
 		atomic_load(&hdr->reader_count), atomic_load(&hdr->reader_pids[0]),
 		atomic_load(&hdr->reader_pids[1]), atomic_load(&hdr->reader_pids[2]),
 		atomic_load(&hdr->reader_pids[3]));
+
+	/* v5: producer-side source-sequence loss accounting. drop_source =
+	 * frames the source produced but the producer never fetched;
+	 * drop_publish = fetched but never published; resets = sequence
+	 * domain changes (encoder restart). write_seq gaps, by contrast,
+	 * only reflect ring overflow. */
+	if (hdr->version >= 5) {
+		uint32_t last = atomic_load(&hdr->src_seq_last);
+		if (last == RSS_SRC_SEQ_NONE)
+			fprintf(stderr, "  Src seq:   untracked\n");
+		else
+			fprintf(stderr, "  Src seq:   %u\n", last);
+		fprintf(stderr,
+			"  Missed:    %u source, %u publish, %u resets\n",
+			atomic_load(&hdr->drop_source), atomic_load(&hdr->drop_publish),
+			atomic_load(&hdr->src_seq_resets));
+	}
 }
 
 static int64_t clock_monotonic_raw_us(void)
@@ -247,6 +264,16 @@ int main(int argc, char **argv)
 	int64_t lat_min = INT64_MAX, lat_max = 0, lat_sum = 0;
 	uint64_t lat_count = 0;
 
+	/* v5: source-sequence gap tracking (consumer side). The producer
+	 * tallies lifetime loss in the header; this measures what THIS
+	 * consumer observed between consecutive reads — slot src_seq jumps
+	 * include frames the producer never published. Gated on v5: a v4
+	 * ring's slot src_seq bytes are unwritten padding. */
+	bool src_seq_ok = hdr->version >= 5;
+	uint32_t last_src_seq = 0;
+	bool src_seq_seen = false;
+	uint64_t src_gap_events = 0, src_gap_frames = 0;
+
 	uint32_t ring_codec = rss_ring_get_header(ring)->codec;
 	uint32_t buf_size = rss_ring_max_frame_size(ring);
 	uint8_t *frame_buf = malloc(buf_size);
@@ -287,6 +314,18 @@ int main(int argc, char **argv)
 
 		if (frame_count == 0)
 			first_ts = meta.timestamp;
+
+		if (src_seq_ok && meta.src_seq != RSS_SRC_SEQ_NONE) {
+			if (src_seq_seen) {
+				int32_t gap = (int32_t)(meta.src_seq - last_src_seq);
+				if (gap > 1) {
+					src_gap_events++;
+					src_gap_frames += (uint64_t)(gap - 1);
+				}
+			}
+			src_seq_seen = true;
+			last_src_seq = meta.src_seq;
+		}
 
 		int64_t dt = meta.timestamp - last_ts;
 		last_ts = meta.timestamp;
@@ -361,6 +400,18 @@ int main(int argc, char **argv)
 			"Samples: %" PRIu64 "\n",
 			(double)lat_min / 1000.0, (double)(lat_sum / (int64_t)lat_count) / 1000.0,
 			(double)lat_max / 1000.0, lat_count);
+
+	if (src_seq_seen) {
+		fprintf(stderr,
+			"\n--- source seq loss (this session) ---\n"
+			"Gaps:     %" PRIu64 " event(s), %" PRIu64 " frame(s) missed\n",
+			src_gap_events, src_gap_frames);
+		if (hdr->version >= 5)
+			fprintf(stderr,
+				"Lifetime: %u source, %u publish, %u resets (producer totals)\n",
+				atomic_load(&hdr->drop_source), atomic_load(&hdr->drop_publish),
+				atomic_load(&hdr->src_seq_resets));
+	}
 
 	free(frame_buf);
 	rss_ring_release(ring);
